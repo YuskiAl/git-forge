@@ -25,6 +25,15 @@ export function errorJson(status: number, message: string, requestId: string): H
 }
 
 /** Read a whole request body (bounded; pushes are at most a few MiB). */
+export const EMPTY_BODY: Buffer = Buffer.alloc(0);
+
+/** True when the request carries a body (Content-Length > 0 or chunked). GETs in the suite carry none; skipping their body read saves a full event-loop turn per request. */
+export function requestHasBody(req: import('node:http').IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  if (length !== undefined && Number.parseInt(length, 10) > 0) return true;
+  const encoding = req.headers['transfer-encoding'];
+  return encoding !== undefined && encoding !== '';
+}
 export function readBody(req: import('node:http').IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];

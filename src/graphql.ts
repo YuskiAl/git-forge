@@ -12,7 +12,7 @@ import { errorJson, json } from './http.ts';
 import type { HttpResult } from './http.ts';
 import { buildTreeFromFlat, diffFlat, headTarget, isOid, makeServerCommit, mergeBase, type FlatFile } from './git.ts';
 import { filesAt, mergedFiles, prConflicts } from './rest.ts';
-import { VIEWER_LOGIN, type Issue, type PullRequest, type Repo, type Store } from './store.ts';
+import { VIEWER_LOGIN, clearIssueCache, type Issue, type PullRequest, type Repo, type Store } from './store.ts';
 
 // ---------------------------------------------------------------------------
 // parser
@@ -765,6 +765,7 @@ function resolveRootField(ctx: ExecutorContext, operation: Operation, selection:
       if (issue === undefined) return null;
       issue.state = 'closed';
       issue.updatedSeq = ctx.store.tick();
+      clearIssueCache(issue);
       return resolveSelections(ctx, 'CloseIssuePayload', { issue }, selection.selections, (inner, _t, source, sel) => {
         if (sel.name === 'issue') {
           return resolveSelections(inner, 'Issue', (source as { issue: Issue }).issue, sel.selections, (c2, _t2, src2, sel2) => resolveIssue(c2, repo.id, src2 as Issue, sel2));
@@ -876,6 +877,7 @@ function resolveRootField(ctx: ExecutorContext, operation: Operation, selection:
       repo.nextCommentId += 1;
       const comment = { id: commentId, body: String(input.body ?? ''), user: VIEWER_LOGIN, createdSeq: ctx.store.tick() };
       issue.comments.push(comment);
+      clearIssueCache(issue);
       const commentNode = { id: encodeGlobalId('IssueComment', repo.id, number, commentId), body: comment.body };
       return resolveSelections(ctx, 'AddCommentPayload', { comment: commentNode }, selection.selections, (inner, _t, source, sel) => {
         if (sel.name === 'commentEdge') {

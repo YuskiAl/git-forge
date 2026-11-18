@@ -23,7 +23,7 @@ import {
 } from './git.ts';
 import { errorJson, json, linkHeader, paginate, pageParams } from './http.ts';
 import type { HttpResult } from './http.ts';
-import { VIEWER_EMAIL, VIEWER_LOGIN, VIEWER_NAME, type Issue, type PullRequest, type Repo, type Store } from './store.ts';
+import { VIEWER_EMAIL, VIEWER_LOGIN, VIEWER_NAME, clearAllIssueCaches, clearIssueCache, type Issue, type PullRequest, type Repo, type Store } from './store.ts';
 
 export interface RestContext {
   store: Store;
@@ -31,8 +31,11 @@ export interface RestContext {
   host: string;
 }
 
+/** The viewer user object: constant for the trial; shared, never mutated. */
+const USER_JSON = { login: VIEWER_LOGIN, id: 1000, name: VIEWER_NAME, email: VIEWER_EMAIL, type: 'User' };
+
 function userJson() {
-  return { login: VIEWER_LOGIN, id: 1000, name: VIEWER_NAME, email: VIEWER_EMAIL, type: 'User' };
+  return USER_JSON;
 }
 
 function repoJson(ctx: RestContext, repo: Repo): Record<string, unknown> {
@@ -95,6 +98,29 @@ function issueJson(ctx: RestContext, repo: Repo, issue: Issue): Record<string, u
     author_association: 'OWNER',
     url: `http://${ctx.host}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     html_url: `http://${ctx.host}/${repo.owner}/${repo.name}/issues/${issue.number}`,
+  };
+}
+
+/**
+ * The single-issue GET body as bytes, cached on the issue. The body is a pure
+ * function of the issue + its repo's labels + host, so a hit is byte-identical
+ * to a fresh render; every mutation path clears the cache (see clearIssueCache
+ * call sites). The per-request X-GitHub-Request-Id header is NOT cached: the
+ * caller sets it fresh on every reply.
+ */
+function issueBody(ctx: RestContext, repo: Repo, issue: Issue): Buffer {
+  if (issue.cachedBody !== undefined && issue.cachedHost === ctx.host) return issue.cachedBody;
+  const body = Buffer.from(JSON.stringify(issueJson(ctx, repo, issue)), 'utf8');
+  issue.cachedBody = body;
+  issue.cachedHost = ctx.host;
+  return body;
+}
+
+function issueResult(ctx: RestContext, repo: Repo, issue: Issue, status: number): HttpResult {
+  return {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-GitHub-Request-Id': ctx.requestId },
+    body: issueBody(ctx, repo, issue),
   };
 }
 
@@ -330,6 +356,8 @@ export async function handleRest(
       store.repos.delete(store.key(owner, repoName));
       repo.name = body.name;
       store.repos.set(store.key(owner, repo.name), repo);
+      // Issue bodies embed the repo name in their urls.
+      clearAllIssueCaches(repo);
     }
     return json(200, repoJson(ctx, repo), { 'X-GitHub-Request-Id': rid });
   }
@@ -490,6 +518,8 @@ export async function handleRest(
       if (name === '') return errorJson(422, 'name is required', rid);
       const label = { name, color: typeof body?.color === 'string' ? body.color : 'ededed', description: typeof body?.description === 'string' ? body.description : '' };
       repo.labels.set(name, label);
+      // Label rendering (color/description) is baked into cached issue bodies.
+      clearAllIssueCaches(repo);
       return json(201, labelJson(label), { 'X-GitHub-Request-Id': rid });
     }
     return notFound();
@@ -544,7 +574,7 @@ export async function handleRest(
           comments: [],
         };
         repo.issues.set(number, issue);
-        return json(201, issueJson(ctx, repo, issue), { 'X-GitHub-Request-Id': rid });
+        return issueResult(ctx, repo, issue, 201);
       }
       return notFound();
     }
@@ -552,7 +582,7 @@ export async function handleRest(
     const issue = repo.issues.get(number);
     if (issue === undefined) return notFound();
     if (rest.length === 2) {
-      if (method === 'GET') return json(200, issueJson(ctx, repo, issue), { 'X-GitHub-Request-Id': rid });
+      if (method === 'GET') return issueResult(ctx, repo, issue, 200);
       if (method === 'PATCH') {
         if (typeof body?.state === 'string' && (body.state === 'open' || body.state === 'closed')) {
           issue.state = body.state;
@@ -560,7 +590,8 @@ export async function handleRest(
         }
         if (typeof body?.title === 'string') issue.title = body.title;
         if (typeof body?.body === 'string') issue.body = body.body;
-        return json(200, issueJson(ctx, repo, issue), { 'X-GitHub-Request-Id': rid });
+        clearIssueCache(issue);
+        return issueResult(ctx, repo, issue, 200);
       }
       return notFound();
     }
@@ -579,6 +610,8 @@ export async function handleRest(
         const comment = { id: repo.nextCommentId, body: commentBody, user: VIEWER_LOGIN, createdSeq: store.tick() };
         repo.nextCommentId += 1;
         issue.comments.push(comment);
+        // The issue body carries the comment count.
+        clearIssueCache(issue);
         return json(201, { id: comment.id, body: comment.body, user: userJson(), created_at: ctx.store.isoOf(comment.createdSeq) }, { 'X-GitHub-Request-Id': rid });
       }
       return notFound();
