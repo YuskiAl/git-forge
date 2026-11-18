@@ -549,7 +549,9 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    // Level 1: the pack is checksummed and re-inflated by the client, never
+    // stored; speed beats size here (fetch is a timed workload).
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -645,11 +647,16 @@ const UPLOAD_V2_CAPS = ['ls-refs=unborn', 'fetch=shallow', 'object-format=sha1']
 const UPLOAD_V0_CAPS = 'symref=HEAD:refs/heads/main side-band-64k shallow thin-pack ofs-delta agent=git-forge/1.0';
 const RECEIVE_V0_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0';
 
-/** The v2 capability advertisement: `version 2` then one capability per line. */
+/** The v2 capability advertisement: `version 2` then one capability per line. Static: built once. */
 export function advertisementV2(): Buffer {
-  const lines: Array<string | 'flush'> = ['version 2\n', ...UPLOAD_V2_CAPS.map((cap) => `${cap}\n`), 'flush'];
-  return pktLines(lines);
+  return ADV_V2;
 }
+
+const ADV_V2: Buffer = pktLines([
+  'version 2\n',
+  ...UPLOAD_V2_CAPS.map((cap) => `${cap}\n`),
+  'flush',
+]);
 
 /**
  * The v0 ref advertisement, with the `# service=...` preamble. The first ref
@@ -657,6 +664,21 @@ export function advertisementV2(): Buffer {
  * the `capabilities^{}` pseudo-ref instead.
  */
 export function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // Cache by the full ref fingerprint: any ref move changes the key.
+  const fingerprint = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, oid]) => `${name}=${oid}`)
+    .join(';');
+  const key = `${service}|${fingerprint}`;
+  const cached = repo.advCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildAdvertisementV0(repo, service);
+  if (repo.advCache.size > 16) repo.advCache.clear();
+  repo.advCache.set(key, built);
+  return built;
+}
+
+function buildAdvertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
   const refs = sortedRefs(repo);
@@ -870,8 +892,46 @@ export function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
   return { objects, shallow: [...shallow].sort(), unshallow: unshallow.sort() };
 }
 
+/**
+ * Fetch cache key. The object database is append-only, so (head tip, object
+ * count) plus the request args fully determine the response bytes: any push,
+ * ref move or new object changes the key. No wall clock or per-request data
+ * enters a fetch response, so a cached body is byte-identical to a fresh one.
+ */
+function fetchCacheKey(repo: Repo, protocol: 'v0' | 'v2', args: FetchArgs): string {
+  const tip = repo.refs.get(defaultBranchRef(repo)) ?? '';
+  return [
+    protocol,
+    repo.id,
+    tip,
+    repo.objects.size,
+    args.wants.join(','),
+    args.haves.join(','),
+    args.shallow.join(','),
+    args.depth === null ? '' : String(args.depth),
+    args.deepenSince === null ? '' : String(args.deepenSince),
+    args.deepenNot.join(','),
+  ].join('|');
+}
+
+/** Store a fetch response unless it is huge; keep the cache bounded. */
+function cacheFetchResponse(repo: Repo, key: string, body: Buffer): void {
+  if (body.length > 2 * 1024 * 1024) return;
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(key, body);
+}
+
 /** The v2 fetch response: acknowledgments, shallow-info, packfile sections. */
 export function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, 'v2', args);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildFetchV2Response(repo, args);
+  cacheFetchResponse(repo, key, built);
+  return built;
+}
+
+function buildFetchV2Response(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
   const parts: Buffer[] = [];
   parts.push(pktLines(['acknowledgments\n', 'NAK\n', 'delim']));
@@ -893,6 +953,15 @@ export function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
 
 /** The v0 fetch response: NAK, shallow lines, then the sideband pack. */
 export function fetchV0Response(repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, 'v0', args);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildFetchV0Response(repo, args);
+  cacheFetchResponse(repo, key, built);
+  return built;
+}
+
+function buildFetchV0Response(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
   const lines: Array<string | 'flush'> = ['NAK\n'];
   for (const oid of plan.shallow) lines.push(`shallow ${oid}\n`);

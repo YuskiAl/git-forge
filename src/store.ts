@@ -35,6 +35,9 @@ export interface Issue {
   createdSeq: number;
   updatedSeq: number;
   comments: IssueComment[];
+  /** Cached single-issue GET body (JSON bytes) for `cachedHost`; cleared on any mutation of the issue. */
+  cachedBody?: Buffer;
+  cachedHost?: string;
 }
 
 export interface PullRequest {
@@ -73,6 +76,21 @@ export interface Repo {
   /** One counter for issues and pull requests, as GitHub numbers them. */
   nextNumber: number;
   nextCommentId: number;
+  /** Fetch-response cache: cache key -> whole fetch response body (pack included). Keys embed the head tip, object count and request args, so any store change misses. */
+  fetchCache: Map<string, Buffer>;
+  /** v0 advertisement cache: ref fingerprint + service -> advertisement body. */
+  advCache: Map<string, Buffer>;
+}
+
+/** Drop one issue's cached GET body (call on any mutation of that issue). */
+export function clearIssueCache(issue: Issue): void {
+  issue.cachedBody = undefined;
+  issue.cachedHost = undefined;
+}
+
+/** Drop every issue body cache in a repo (label set / repo rename change rendering). */
+export function clearAllIssueCaches(repo: Repo): void {
+  for (const issue of repo.issues.values()) clearIssueCache(issue);
 }
 
 /** 2025-01-01T00:00:00Z, the epoch every deterministic timestamp derives from. */
@@ -89,6 +107,8 @@ export class Store {
   nextRepoId = 1;
   /** Deterministic clock: incremented once per created entity or commit. */
   seq = 0;
+  /** Memoised ISO timestamps: seq values repeat across renders of one entity. */
+  private isoCache = new Map<number, string>();
 
   key(owner: string, name: string): string {
     return `${owner}/${name}`;
@@ -105,7 +125,12 @@ export class Store {
   }
 
   isoOf(epochSec: number): string {
-    return new Date(epochSec * 1000).toISOString().replace('.000Z', 'Z');
+    const cached = this.isoCache.get(epochSec);
+    if (cached !== undefined) return cached;
+    const value = new Date(epochSec * 1000).toISOString().replace('.000Z', 'Z');
+    if (this.isoCache.size > 200_000) this.isoCache.clear();
+    this.isoCache.set(epochSec, value);
+    return value;
   }
 
   createRepo(owner: string, name: string, description: string, isPrivate: boolean): Repo {
@@ -126,6 +151,8 @@ export class Store {
       pulls: new Map(),
       nextNumber: 1,
       nextCommentId: 1,
+      fetchCache: new Map(),
+      advCache: new Map(),
     };
     this.seq += 1;
     this.repos.set(this.key(owner, name), repo);

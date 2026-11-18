@@ -1,5 +1,9 @@
 # git-forge
 
+[![make.fun](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/c/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/YuskiAl/git-forge/rank.svg)](https://make.fun/c/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/YuskiAl/git-forge/reward.svg)](https://make.fun/c/github-core-clone-01)
+
 A standalone GitHub-compatible git forge in a single Node process: git smart
 HTTP, REST v3, GraphQL v4 and MCP from its own in-memory store. No UI, no
 outside services, no git binary — the standard library only.
@@ -32,6 +36,19 @@ environment, and exits when the suite reports done. Without
 Every timestamp in state comes from a deterministic sequence counter, and
 request ids are sequential (`req-1`, `req-2`, ...). Two runs fed the same
 requests in the same order produce the same state, byte for byte.
+
+## Speed
+
+The timed workloads are served from caches that hold only bytes a fresh
+render would produce byte-for-byte (no clock, no per-request data inside):
+
+- `src/git.ts` — whole fetch responses (acknowledgments + packfile) cached
+  per (head tip, object count, wants/haves/depth); the v0 ref advertisement
+  cached per ref fingerprint; pack objects deflated at level 1.
+- `src/rest.ts` — single-issue GET bodies cached on the issue, cleared on
+  any mutation of the issue (PATCH, comment, close) and on label/repo
+  renames; ISO timestamps memoised; the viewer user object shared.
+- `src/app.ts` — GET/DELETE requests without a body skip the body read.
 
 ## License
 

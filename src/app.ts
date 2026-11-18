@@ -7,7 +7,7 @@
 // another owner is 404, never 403.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { errorJson, json, parseJsonBody, raw, readBody } from './http.ts';
+import { errorJson, json, parseJsonBody, raw, readBody, requestHasBody, EMPTY_BODY } from './http.ts';
 import type { HttpResult } from './http.ts';
 import {
   advertisementV0,
@@ -79,7 +79,7 @@ export function createApp(store: Store, shopToken: string): ReturnType<typeof cr
             send(res, errorJson(404, 'Not Found', rid));
             return;
           }
-          const body = await readBody(req);
+          const body = requestHasBody(req) ? await readBody(req) : EMPTY_BODY;
           if (method === 'GET' && servicePath === 'info/refs') {
             const service = url.searchParams.get('service') ?? '';
             if (service === 'git-upload-pack') {
@@ -138,7 +138,7 @@ export function createApp(store: Store, shopToken: string): ReturnType<typeof cr
         // ---- REST v3 ----
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           const segments = path.split('/').filter((part) => part !== '').slice(2);
-          const rawBody = method === 'GET' || method === 'DELETE' ? await readBody(req) : await readBody(req);
+          const rawBody = requestHasBody(req) ? await readBody(req) : EMPTY_BODY;
           let parsedBody: Record<string, unknown> | null = {};
           if (rawBody.length > 0) {
             const parsed = parseJsonBody(rawBody);
@@ -192,5 +192,9 @@ export function createApp(store: Store, shopToken: string): ReturnType<typeof cr
       }
     })();
   });
+  // The bench reuses one keep-alive socket for 2,000 sequential reads; a
+  // 5 s idle close (the default) turns a scheduling stall into a failed
+  // request, so hold idle sockets much longer than any stall between rounds.
+  server.keepAliveTimeout = 60_000;
   return server;
 }
