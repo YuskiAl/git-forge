@@ -452,9 +452,10 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     typeCode: number;
     size: number;
     data: Buffer;
+    rawZlib?: Buffer;
     baseOffset?: number;
     baseOid?: string;
-    resolved?: { type: GitObjectType; data: Buffer; oid: string };
+    resolved?: { type: GitObjectType; data: Buffer; oid: string; rawZlib?: Buffer };
   }
   const raw: Raw[] = [];
   const byOffset = new Map<number, Raw>();
@@ -475,9 +476,14 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     } else if (CODE_TYPE[typeCode] === undefined) {
       throw new Error(`unknown pack type ${typeCode}`);
     }
+    const zlibStart = offset;
     const inflated = inflateSync(pack.subarray(offset, trailerStart), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     if (inflated.buffer.length !== header.size) throw new Error('pack entry size mismatch');
     entry.data = inflated.buffer;
+    // Zero-deflate: keep the exact zlib bytes for plain entries, so writePack
+    // can reuse them verbatim. Delta entries resolve to new data, so their
+    // zlib stream (a delta) must never be reused as a full object.
+    if (typeCode !== 6 && typeCode !== 7) entry.rawZlib = pack.subarray(zlibStart, zlibStart + inflated.engine.bytesWritten);
     offset += inflated.engine.bytesWritten;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
@@ -485,7 +491,7 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
   const objects = new Map<string, GitObject>();
   const resolvedByOid = new Map<string, Raw>();
   const resolving = new Set<number>();
-  const resolve = (entry: Raw): { type: GitObjectType; data: Buffer; oid: string } => {
+  const resolve = (entry: Raw): { type: GitObjectType; data: Buffer; oid: string; rawZlib?: Buffer } => {
     if (entry.resolved !== undefined) return entry.resolved;
     if (resolving.has(entry.offset)) throw new Error('delta cycle');
     resolving.add(entry.offset);
@@ -512,14 +518,18 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
       data = entry.data;
     }
     const oid = hashObject(type, data);
-    entry.resolved = { type, data, oid };
+    entry.resolved = { type, data, oid, rawZlib: entry.rawZlib };
     resolvedByOid.set(oid, entry);
     resolving.delete(entry.offset);
     return entry.resolved;
   };
   for (const entry of raw) {
     const resolved = resolve(entry);
-    if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
+    if (!objects.has(resolved.oid)) {
+      objects.set(resolved.oid, resolved.rawZlib !== undefined
+        ? { type: resolved.type, data: resolved.data, rawZlib: resolved.rawZlib }
+        : { type: resolved.type, data: resolved.data });
+    }
   }
   return objects;
 }
@@ -550,8 +560,10 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
     // Level 1: the pack is checksummed and re-inflated by the client, never
-    // stored; speed beats size here (fetch is a timed workload).
-    parts.push(deflateSync(object.data, { level: 1 }));
+    // stored; speed beats size here (fetch is a timed workload). When the
+    // object arrived in a pack, its original zlib bytes are reused verbatim
+    // instead: zero-deflate, no inflate/deflate round-trip at all.
+    parts.push(object.rawZlib !== undefined ? object.rawZlib : deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -733,7 +745,29 @@ export function parseLsRefsArgs(packets: readonly Packet[]): LsRefsArgs {
   return args;
 }
 
+/** ls-refs responses are a pure function of the refs + args, so cache them by ref fingerprint (same invalidation-by-key trick as advertisementV0). */
+const LS_REFS_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+
 export function lsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
+  const fingerprint = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, oid]) => `${name}=${oid}`)
+    .join(';');
+  const key = `${fingerprint}|${args.peel ? 1 : 0}|${args.symrefs ? 1 : 0}|${args.unborn ? 1 : 0}|${args.prefixes.join(',')}`;
+  let cache = LS_REFS_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    LS_REFS_CACHE.set(repo, cache);
+  }
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildLsRefsResponse(repo, args);
+  if (cache.size > 32) cache.clear();
+  cache.set(key, built);
+  return built;
+}
+
+function buildLsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
   const lines: string[] = [];
   const tip = headTarget(repo);
   const refs = sortedRefs(repo);

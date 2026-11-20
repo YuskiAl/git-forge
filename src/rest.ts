@@ -108,7 +108,7 @@ function issueJson(ctx: RestContext, repo: Repo, issue: Issue): Record<string, u
  * call sites). The per-request X-GitHub-Request-Id header is NOT cached: the
  * caller sets it fresh on every reply.
  */
-function issueBody(ctx: RestContext, repo: Repo, issue: Issue): Buffer {
+export function issueBody(ctx: RestContext, repo: Repo, issue: Issue): Buffer {
   if (issue.cachedBody !== undefined && issue.cachedHost === ctx.host) return issue.cachedBody;
   const body = Buffer.from(JSON.stringify(issueJson(ctx, repo, issue)), 'utf8');
   issue.cachedBody = body;

@@ -2,13 +2,13 @@
 // with the trial environment, serve until the suite reports done, exit 0.
 // The shop token is read from the environment the trial provides.
 
-import { createApp } from './src/app.ts';
+import { createRawServer } from './src/raw.ts';
 import { Store } from './src/store.ts';
 
 const envUrl = process.env.MAKEFUN_ENV_URL ?? '';
 const shopToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const store = new Store();
-const server = createApp(store, shopToken);
+const server = createRawServer(store, shopToken);
 
 function postJson(url: string, payload: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {

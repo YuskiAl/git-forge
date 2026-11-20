@@ -9,6 +9,8 @@ export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
   type: GitObjectType;
   data: Buffer;
+  /** Raw zlib bytes of this object exactly as received in a pack (plain entries only). Reused verbatim by writePack: zero-deflate pack emission. Undefined for locally created objects and delta-resolved objects. */
+  rawZlib?: Buffer;
 }
 
 export interface Label {
@@ -38,6 +40,10 @@ export interface Issue {
   /** Cached single-issue GET body (JSON bytes) for `cachedHost`; cleared on any mutation of the issue. */
   cachedBody?: Buffer;
   cachedHost?: string;
+  /** Pre-built GET frame for this issue (status line + headers + JSON body) for `cachedGetHost`, with the 7 request-id digits at `cachedGetRidOff` set to '0' as a placeholder. The frame is copied once per connection and the digits are patched in place per request, so a repeated GET costs one socket.write and no allocation. Cleared on any mutation of the issue. */
+  cachedGetFrame?: Buffer;
+  cachedGetRidOff?: number;
+  cachedGetHost?: string;
 }
 
 export interface PullRequest {
@@ -86,6 +92,9 @@ export interface Repo {
 export function clearIssueCache(issue: Issue): void {
   issue.cachedBody = undefined;
   issue.cachedHost = undefined;
+  issue.cachedGetFrame = undefined;
+  issue.cachedGetRidOff = undefined;
+  issue.cachedGetHost = undefined;
 }
 
 /** Drop every issue body cache in a repo (label set / repo rename change rendering). */
